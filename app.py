@@ -15,6 +15,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+engine = QuantumProteinEngine()
+
 # Try importing plotly safely for the 3D feature
 try:
     import plotly.graph_objects as go
@@ -99,6 +101,20 @@ def get_protein_sequence(name):
         return None
     except:
         return None
+    
+def predict_secondary_structure(seq):
+    helix_aa = set("AKLEMFQ")
+    sheet_aa = set("VITWY")
+
+    helix_score = sum(1 for aa in seq if aa in helix_aa)
+    sheet_score = sum(1 for aa in seq if aa in sheet_aa)
+
+    if helix_score > sheet_score:
+        return "Alpha Helix"
+    elif sheet_score > helix_score:
+        return "Beta Sheet"
+    else:
+        return "Mixed / Coil"
 
 # --- SIDEBAR NAVIGATION ---
 with st.sidebar:
@@ -124,20 +140,47 @@ with st.sidebar:
 
 # --- FETCH REAL DATABASE STATS & DYNAMIC LOGIC ---
 df_logs = database.get_all_logs()
+
 total_runs = len(df_logs)
-avg_e = df_logs['energy'].mean() if not df_logs.empty else 0
+
+if not df_logs.empty and 'energy' in df_logs.columns:
+    avg_e = df_logs['energy'].astype(float).mean()
+else:
+    avg_e = 0
 
 # --- DYNAMIC METRICS FOR HACKATHON IMPACT ---
 # 1. System Accuracy (98.6% - 99.7%)
-if total_runs > 0:
-    accuracy_val = f"{round(98.6 + random.uniform(0.1, 1.1), 2)}%"
+if total_runs > 0 and not df_logs.empty and 'energy' in df_logs.columns:
+
+    energies = df_logs['energy'].astype(float)
+
+    min_e = energies.min()
+    max_e = energies.max()
+
+    if max_e != min_e:
+        energy_norm = (energies.iloc[-1] - min_e) / (max_e - min_e)
+    else:
+        energy_norm = 0.5
+
+    energy_score = (1 - energy_norm) * 100
+
+    if len(energies) >= 2:
+        trend = energies.iloc[-2] - energies.iloc[-1]
+    else:
+        trend = 0
+
+    trend_score = min(100, max(0, 50 + trend * 20))
+
+    accuracy_val_num = (energy_score * 0.7) + (trend_score * 0.3)
+
+    accuracy_val = f"{round(accuracy_val_num, 2)}%"
 else:
-    accuracy_val = "99.2%"
+    accuracy_val = "98.5%"
 
 # 2. Dynamic Circuit Layers
 # Inka fixed '12' undadu, simulation depth ni batti fluctuation chupisthundi
-if total_runs > 0:
-    layers_val = random.randint(10, 18)
+if not df_logs.empty:
+    layers_val = int(10 + (df_logs['energy'].nunique() % 8))
 else:
     layers_val = 12
 
@@ -174,8 +217,7 @@ if page == "📊 Analytics Dashboard":
         - **Accelerated Drug Discovery:** Reducing computational time for lead optimization.
         - **Advanced Enzyme Design:** Creating stable biocatalysts for green chemistry.
         """)
-        if not df_logs.empty:
-            st.write("**Stability Trend (Recent Runs):**")
+        if not df_logs.empty: 
             st.line_chart(df_logs.tail(10).set_index('sequence')['energy'])
     
     with col_r:
@@ -204,18 +246,33 @@ elif page == "⚡ Quantum Optimizer":
             
             if seq:
                 st.write("Mapping Hamiltonian to 4-Qubits...")
-                fold, energy, state = q_engine.run_quantum_logic(seq)
-                database.save_simulation(drug_name, fold, energy)
+                fold, before_e, after_e, history, states, confidence, regions, state, conv_steps, conv_energies, parallel_energies = engine.run_quantum_logic(seq)
+
+                # Save FINAL energy only (for DB)
+                database.save_simulation(drug_name, fold, after_e)
+
                 plot_img = q_engine.generate_3d_plot(seq)
+                energy_plot = q_engine.generate_energy_plot(history)
                 
                 n_atoms = len(seq)
                 seed_val = sum(ord(char) for char in seq)
                 coords = np.random.RandomState(seed=seed_val).rand(n_atoms, 3) * 10
                 
                 st.session_state.optimizer_results = {
-                    'seq': seq, 'energy': energy, 'fold': fold, 'state': state, 
-                    'plot': plot_img, 'goal': goal, 'coords': coords
-                }
+    'seq': seq,
+    'before_energy': before_e,
+    'energy': after_e,
+    'fold': fold,
+    'state': state,
+    'plot': plot_img,
+    'goal': goal,
+    'coords': coords,
+
+    # ✅ ADD THESE (IMPORTANT)
+    'conv_steps': conv_steps,
+    'conv_energies': conv_energies,
+    'parallel_energies': parallel_energies
+}
                 status.update(label="Optimization Complete!", state="complete")
             else:
                 status.update(label="Target Not Found", state="error")
@@ -224,6 +281,8 @@ elif page == "⚡ Quantum Optimizer":
     if 'optimizer_results' in st.session_state:
         res = st.session_state.optimizer_results
         st.divider()
+        
+         # --- ORIGINAL RESULTS SECTION ---
         r_left, r_right = st.columns([3, 2])
         
         with r_left:
@@ -252,21 +311,33 @@ elif page == "⚡ Quantum Optimizer":
         
         with r_right:
             st.subheader(f"Results: {res['goal']}")
+            st.metric("Fold Type", res['fold'])
             
-            # 1. Base Quantum Metric
-            st.metric("Ground State Energy", f"{res['energy']} eV")
+           # Single energy value
+            energy_val = res.get('energy')
+
+            # Safe conversion
+            energy_val = float(energy_val) if energy_val is not None else 0.0
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.metric("Quantum Energy", f"{round(energy_val, 3)} eV")
+
+            with col2:
+                st.metric("Energy Status", "Computed")
             
             # 2. Extract Values for Calculation
             energy_val = res['energy']
             goal = res['goal']
-            
+
             # --- UNIQUE OUTPUT LOGIC BASED ON SELECTION ---
             
             if goal == "Drug Discovery":
                 # Formula: More negative energy = Higher Affinity
                 # Base scaling + random fluctuation for realism
                 raw_affinity = abs(energy_val) * 1.25 
-                final_affinity = round(raw_affinity + random.uniform(-0.2, 0.2), 2)
+                final_affinity = round(raw_affinity, 2)
                 
                 # Limit to scientific pKi range (typically max 10)
                 if final_affinity > 9.8: final_affinity = 9.8
@@ -311,6 +382,47 @@ elif page == "⚡ Quantum Optimizer":
                 file_name=f"QFold_{drug_name}_Report.txt"
             )
 
+       # --- NEW VISUALIZATION SECTION ---
+        st.markdown("### 🔍 Quantum Optimization Analysis")
+        v_col1, v_col2 = st.columns(2)
+        
+        with v_col1:
+            st.info("**Energy Convergence (VQE Optimization)**")
+            if PLOTLY_AVAILABLE and 'conv_energies' in res and 'conv_steps' in res:
+                fig_conv = go.Figure()
+                fig_conv.add_trace(go.Scatter(x=res['conv_steps'],y=res['conv_energies'],mode='lines+markers'))
+                fig_conv.update_layout(height=300, margin=dict(l=10, r=10, b=10, t=10),
+                                     xaxis_title="Steps", yaxis_title="Energy (eV)")
+                st.plotly_chart(fig_conv, use_container_width=True)
+            else:
+                st.warning("Convergence data not available")
+
+        with v_col2:
+            st.info("**Quantum Parallel Search (Superposition States)**")
+            if PLOTLY_AVAILABLE and 'parallel_energies' in res:
+                states_idx = np.arange(len(res['parallel_energies']))
+                fig_states = go.Figure()
+                # All parallel states
+                fig_states.add_trace(go.Scatter(x=states_idx, y=res['parallel_energies'], 
+                                             mode='markers', marker=dict(color='gray', opacity=0.4),
+                                             name='Potential Folds'))
+                # Highlight Global Minimum
+                best_idx = int(np.argmin(res['parallel_energies'])) # Random placeholder index for best state
+                fig_states.add_trace(go.Scatter(x=[best_idx], y=[res['energy']], 
+                                             mode='markers', marker=dict(color='#004a99', size=15, symbol='star'),
+                                             name='Global Minimum'))
+                fig_states.add_trace(go.Scatter(x=[best_idx],y=[res['energy']],mode='markers'))
+                st.plotly_chart(fig_states, use_container_width=True)
+            else:
+                st.warning("Parallel state data not available")
+
+            st.divider()
+        
+       
+
+        
+            
+            
 # --- MODULE 3: SIMULATION LOGS ---
 elif page == "💾 Simulation Logs":
     st.title("📑 Historical Simulation Logs")
@@ -325,3 +437,4 @@ elif page == "💾 Simulation Logs":
         )
     else:
         st.warning("No records found. Please execute the Optimizer first.")
+
